@@ -1,141 +1,164 @@
+#include "PluginProcessor.h"
 #include "PluginEditor.h"
 
 namespace
 {
-    void styleKnob(juce::Slider& s)
+    constexpr float butterworthQ = 0.70710678f;
+    constexpr float minDb = -1.0f;
+    constexpr float maxDb = 1.0f;
+
+    juce::AudioProcessorValueTreeState::ParameterLayout makeLayout()
     {
-        s.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-        s.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 76, 20);
-        s.setColour(juce::Slider::rotarySliderFillColourId, juce::Colour(0xff3280fc));
-        s.setColour(juce::Slider::rotarySliderOutlineColourId, juce::Colour(0xff343943));
-        s.setColour(juce::Slider::thumbColourId, juce::Colour(0xffd1d5db));
-        s.setColour(juce::Slider::textBoxTextColourId, juce::Colour(0xffb9c0cc));
-        s.setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour(0xff111318));
-        s.setColour(juce::Slider::textBoxOutlineColourId, juce::Colour(0xff30343c));
-    }
-    void styleButton(juce::ToggleButton& b)
-    {
-        b.setClickingTogglesState(true);
-        b.setColour(juce::ToggleButton::textColourId, juce::Colour(0xffe5e7eb));
-        b.setColour(juce::ToggleButton::tickColourId, juce::Colour(0xff3280fc));
-        b.setColour(juce::ToggleButton::tickDisabledColourId, juce::Colour(0xff454b56));
+        using Float = juce::AudioParameterFloat;
+        using Bool = juce::AudioParameterBool;
+        juce::AudioProcessorValueTreeState::ParameterLayout p;
+
+        p.add(std::make_unique<Float>("BassCutoff", "Bass Cutoff",
+            juce::NormalisableRange<float>(20.0f, 1000.0f, 1.0f, 0.35f), 250.0f, "Hz"));
+        p.add(std::make_unique<Float>("MidLowCutoff", "Mids Low Cut",
+            juce::NormalisableRange<float>(20.0f, 2000.0f, 1.0f, 0.35f), 270.0f, "Hz"));
+        p.add(std::make_unique<Float>("MidHighCutoff", "Mids High Cut",
+            juce::NormalisableRange<float>(500.0f, 16000.0f, 1.0f, 0.35f), 3800.0f, "Hz"));
+        p.add(std::make_unique<Float>("HighCutoff", "High Cutoff",
+            juce::NormalisableRange<float>(500.0f, 16000.0f, 1.0f, 0.35f), 3500.0f, "Hz"));
+
+        p.add(std::make_unique<Bool>("SoloBass", "Solo Bass", false));
+        p.add(std::make_unique<Bool>("SoloMids", "Solo Mids", false));
+        p.add(std::make_unique<Bool>("SoloHighs", "Solo Highs", false));
+        p.add(std::make_unique<Bool>("MonitorMid", "Monitor Mid Mono", false));
+        return p;
     }
 }
 
-MonitorUtilityAudioProcessorEditor::MonitorUtilityAudioProcessorEditor(MonitorUtilityAudioProcessor& p)
-    : AudioProcessorEditor(&p), audioProcessor(p)
+MonitorUtilityAudioProcessor::MonitorUtilityAudioProcessor()
+    : AudioProcessor(BusesProperties()
+        .withInput("Input", juce::AudioChannelSet::stereo(), true)
+        .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
+      parameters(*this, nullptr, "PARAMETERS", createParameterLayout())
 {
-    setSize(800, 600);
-    addKeyListener(this);
-    setWantsKeyboardFocus(true);
-
-    header.setText("MONITOR UTILITY", juce::dontSendNotification);
-    header.setJustificationType(juce::Justification::centred);
-    header.setColour(juce::Label::textColourId, juce::Colour(0xffcbd5e1));
-    header.setFont(juce::Font(13.0f, juce::Font::bold));
-    addAndMakeVisible(header);
-
-    auto setupTitle = [this](juce::Label& l, const juce::String& t) {
-        l.setText(t, juce::dontSendNotification);
-        l.setJustificationType(juce::Justification::centred);
-        l.setColour(juce::Label::textColourId, juce::Colour(0xff3280fc));
-        l.setFont(juce::Font(13.0f, juce::Font::bold));
-        addAndMakeVisible(l);
-    };
-    setupTitle(bassTitle, "1. BASS");
-    setupTitle(midsTitle, "2. MIDS");
-    setupTitle(highsTitle, "3. HIGHS");
-    setupTitle(monoTitle, "4. MID (MONO)");
-
-    for (auto* s : { &bass, &midLow, &midHigh, &highs }) { styleKnob(*s); addAndMakeVisible(*s); }
-    for (auto* b : { &soloBass, &soloMids, &soloHighs, &monitorMono }) { styleButton(*b); addAndMakeVisible(*b); }
-
-    bass.setName("Cutoff"); midLow.setName("Low Cut"); midHigh.setName("High Cut"); highs.setName("Cutoff");
-    bassAttachment = std::make_unique<SliderAttachment>(p.parameters, "BassCutoff", bass);
-    midLowAttachment = std::make_unique<SliderAttachment>(p.parameters, "MidLowCutoff", midLow);
-    midHighAttachment = std::make_unique<SliderAttachment>(p.parameters, "MidHighCutoff", midHigh);
-    highsAttachment = std::make_unique<SliderAttachment>(p.parameters, "HighCutoff", highs);
-    bassButtonAttachment = std::make_unique<ButtonAttachment>(p.parameters, "SoloBass", soloBass);
-    midsButtonAttachment = std::make_unique<ButtonAttachment>(p.parameters, "SoloMids", soloMids);
-    highsButtonAttachment = std::make_unique<ButtonAttachment>(p.parameters, "SoloHighs", soloHighs);
-    monoButtonAttachment = std::make_unique<ButtonAttachment>(p.parameters, "MonitorMid", monitorMono);
 }
 
-void MonitorUtilityAudioProcessorEditor::paint(juce::Graphics& g)
+juce::AudioProcessorValueTreeState::ParameterLayout MonitorUtilityAudioProcessor::createParameterLayout()
 {
-    g.fillAll(juce::Colour(0xff090b0f));
-    auto outer = getLocalBounds().reduced(18);
-    g.setColour(juce::Colour(0xff14171d));
-    g.fillRoundedRectangle(outer.toFloat(), 14.0f);
-    g.setColour(juce::Colour(0xff303641));
-    g.drawRoundedRectangle(outer.toFloat(), 14.0f, 1.0f);
+    return makeLayout();
+}
 
-    auto area = outer.reduced(14);
-    area.removeFromTop(34);
-    const int gap = 10;
-    const int w = (area.getWidth() - 3 * gap) / 4;
-    for (int i = 0; i < 4; ++i)
+bool MonitorUtilityAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
+{
+    const auto& in = layouts.getMainInputChannelSet();
+    const auto& out = layouts.getMainOutputChannelSet();
+    return (in == juce::AudioChannelSet::mono() || in == juce::AudioChannelSet::stereo())
+        && in == out;
+}
+
+void MonitorUtilityAudioProcessor::prepareToPlay(double sr, int)
+{
+    currentSampleRate = sr;
+    const juce::dsp::ProcessSpec spec { sr, 1u, 1u };
+    bassL.prepare(spec); bassR.prepare(spec);
+    midHpL.prepare(spec); midHpR.prepare(spec);
+    midLpL.prepare(spec); midLpR.prepare(spec);
+    highL.prepare(spec); highR.prepare(spec);
+
+    bassL.reset(); bassR.reset(); midHpL.reset(); midHpR.reset();
+    midLpL.reset(); midLpR.reset(); highL.reset(); highR.reset();
+
+    lastBass = lastMidLow = lastMidHigh = lastHigh = -1.0f;
+    updateFilters(250.0f, 270.0f, 3800.0f, 3500.0f);
+}
+
+void MonitorUtilityAudioProcessor::updateFilters(float bassHz, float midLowHz, float midHighHz, float highHz)
+{
+    const auto nyquistLimit = static_cast<float>(currentSampleRate * 0.45);
+    bassHz = juce::jlimit(20.0f, nyquistLimit, bassHz);
+    midLowHz = juce::jlimit(20.0f, nyquistLimit, midLowHz);
+    midHighHz = juce::jlimit(30.0f, nyquistLimit, juce::jmax(midHighHz, midLowHz + 5.0f));
+    highHz = juce::jlimit(20.0f, nyquistLimit, highHz);
+
+    auto lpBass = juce::dsp::IIR::Coefficients<float>::makeLowPass(currentSampleRate, bassHz, butterworthQ);
+    auto hpMid = juce::dsp::IIR::Coefficients<float>::makeHighPass(currentSampleRate, midLowHz, butterworthQ);
+    auto lpMid = juce::dsp::IIR::Coefficients<float>::makeLowPass(currentSampleRate, midHighHz, butterworthQ);
+    auto hpHigh = juce::dsp::IIR::Coefficients<float>::makeHighPass(currentSampleRate, highHz, butterworthQ);
+
+    *bassL.coefficients = *lpBass; *bassR.coefficients = *lpBass;
+    *midHpL.coefficients = *hpMid; *midHpR.coefficients = *hpMid;
+    *midLpL.coefficients = *lpMid; *midLpR.coefficients = *lpMid;
+    *highL.coefficients = *hpHigh; *highR.coefficients = *hpHigh;
+
+    lastBass = bassHz; lastMidLow = midLowHz; lastMidHigh = midHighHz; lastHigh = highHz;
+}
+
+void MonitorUtilityAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+{
+    juce::ScopedNoDenormals noDenormals;
+    const int channels = getTotalNumInputChannels();
+    const int samples = buffer.getNumSamples();
+
+    for (int ch = getTotalNumOutputChannels(); ch < buffer.getNumChannels(); ++ch)
+        buffer.clear(ch, 0, samples);
+
+    const auto bassFreq = parameters.getRawParameterValue("BassCutoff")->load();
+    const auto midLowFreq = parameters.getRawParameterValue("MidLowCutoff")->load();
+    const auto midHighFreq = parameters.getRawParameterValue("MidHighCutoff")->load();
+    const auto highFreq = parameters.getRawParameterValue("HighCutoff")->load();
+
+    if (bassFreq != lastBass || midLowFreq != lastMidLow || midHighFreq != lastMidHigh || highFreq != lastHigh)
+        updateFilters(bassFreq, midLowFreq, midHighFreq, highFreq);
+
+    const bool soloBass = parameters.getRawParameterValue("SoloBass")->load() > 0.5f;
+    const bool soloMids = parameters.getRawParameterValue("SoloMids")->load() > 0.5f;
+    const bool soloHighs = parameters.getRawParameterValue("SoloHighs")->load() > 0.5f;
+    const bool mono = parameters.getRawParameterValue("MonitorMid")->load() > 0.5f;
+    const bool anySolo = soloBass || soloMids || soloHighs;
+
+    auto* left = buffer.getWritePointer(0);
+    auto* right = channels > 1 ? buffer.getWritePointer(1) : nullptr;
+
+    for (int i = 0; i < samples; ++i)
     {
-        auto panel = juce::Rectangle<int>(area.getX() + i * (w + gap), area.getY(), w, area.getHeight());
-        g.setColour(juce::Colour(0xff1b1f27));
-        g.fillRoundedRectangle(panel.toFloat(), 10.0f);
-        g.setColour(juce::Colour(0xff343a45));
-        g.drawRoundedRectangle(panel.toFloat(), 10.0f, 1.0f);
-    }
-    g.setColour(juce::Colour(0xff343a45));
-    g.drawLine(static_cast<float>(outer.getX() + 14), static_cast<float>(outer.getY() + 39),
-               static_cast<float>(outer.getRight() - 14), static_cast<float>(outer.getY() + 39), 1.0f);
-}
+        const float dryL = left[i];
+        const float dryR = right != nullptr ? right[i] : dryL;
+        const float inL = mono ? 0.5f * (dryL + dryR) : dryL;
+        const float inR = mono ? 0.5f * (dryL + dryR) : dryR;
 
-void MonitorUtilityAudioProcessorEditor::resized()
-{
-    auto outer = getLocalBounds().reduced(32);
-    header.setBounds(outer.removeFromTop(34));
-    outer.removeFromTop(24);
-    const int gap = 10;
-    const int w = (outer.getWidth() - 3 * gap) / 4;
+        // Keep all filter states advancing even when a band is not selected.
+        const float bassOutL = bassL.processSample(0, inL);
+        const float bassOutR = bassR.processSample(0, inR);
+        const float midsOutL = midLpL.processSample(0, midHpL.processSample(0, inL));
+        const float midsOutR = midLpR.processSample(0, midHpR.processSample(0, inR));
+        const float highsOutL = highL.processSample(0, inL);
+        const float highsOutR = highR.processSample(0, inR);
 
-    auto placePanel = [&](int index, juce::Label& title, std::initializer_list<juce::Component*> controls) {
-        auto panel = juce::Rectangle<int>(outer.getX() + index * (w + gap), outer.getY(), w, outer.getHeight()).reduced(10);
-        title.setBounds(panel.removeFromTop(30));
-        panel.removeFromTop(12);
-        for (auto* c : controls)
+        float outL = inL, outR = inR;
+        if (anySolo)
         {
-            if (c == &midLow || c == &midHigh)
-            {
-                const int half = (panel.getWidth() - 4) / 2;
-                c->setBounds(panel.removeFromTop(170).withWidth(half));
-                // The second mids knob is placed beside the first below.
-            }
-            else
-            {
-                c->setBounds(panel.removeFromTop(190).withSizeKeepingCentre(110, 170));
-            }
-            panel.removeFromTop(8);
+            outL = outR = 0.0f;
+            if (soloBass) { outL += bassOutL; outR += bassOutR; }
+            if (soloMids) { outL += midsOutL; outR += midsOutR; }
+            if (soloHighs) { outL += highsOutL; outR += highsOutR; }
         }
-    };
 
-    // Explicit bounds keep the four modules balanced and readable.
-    auto panel = [&](int i) { return juce::Rectangle<int>(outer.getX() + i * (w + gap), outer.getY(), w, outer.getHeight()).reduced(10); };
-    auto p0 = panel(0); bassTitle.setBounds(p0.removeFromTop(30)); bass.setBounds(p0.removeFromTop(220).withSizeKeepingCentre(112, 190)); p0.removeFromTop(8); soloBass.setBounds(p0.removeFromTop(42));
-    auto p1 = panel(1); midsTitle.setBounds(p1.removeFromTop(30));
-    auto knobs = p1.removeFromTop(220); const int half = (knobs.getWidth() - 4) / 2;
-    midLow.setBounds(knobs.removeFromLeft(half)); knobs.removeFromLeft(4); midHigh.setBounds(knobs);
-    p1.removeFromTop(8); soloMids.setBounds(p1.removeFromTop(42));
-    auto p2 = panel(2); highsTitle.setBounds(p2.removeFromTop(30)); highs.setBounds(p2.removeFromTop(220).withSizeKeepingCentre(112, 190)); p2.removeFromTop(8); soloHighs.setBounds(p2.removeFromTop(42));
-    auto p3 = panel(3); monoTitle.setBounds(p3.removeFromTop(30));
-    auto indicator = p3.removeFromTop(220);
-    monitorMono.setBounds(p3.removeFromTop(42));
-    // The toggle button is the mono status/action indicator in this native build.
+        left[i] = juce::jlimit(-1.0f, 1.0f, outL);
+        if (right != nullptr)
+            right[i] = juce::jlimit(-1.0f, 1.0f, outR);
+    }
 }
 
-bool MonitorUtilityAudioProcessorEditor::keyPressed(const juce::KeyPress& key, juce::Component*)
+void MonitorUtilityAudioProcessor::getStateInformation(juce::MemoryBlock& dest)
 {
-    const auto c = juce::CharacterFunctions::toLowerCase(key.getTextCharacter());
-    if (c == '1') soloBass.setToggleState(!soloBass.getToggleState(), juce::sendNotification);
-    else if (c == '2') soloMids.setToggleState(!soloMids.getToggleState(), juce::sendNotification);
-    else if (c == '3') soloHighs.setToggleState(!soloHighs.getToggleState(), juce::sendNotification);
-    else if (c == '4') monitorMono.setToggleState(!monitorMono.getToggleState(), juce::sendNotification);
-    else return false;
-    return true;
+    auto state = parameters.copyState();
+    std::unique_ptr<juce::XmlElement> xml(state.createXml());
+    copyXmlToBinary(*xml, dest);
+}
+
+void MonitorUtilityAudioProcessor::setStateInformation(const void* data, int size)
+{
+    std::unique_ptr<juce::XmlElement> xml(getXmlFromBinary(data, size));
+    if (xml != nullptr && xml->hasTagName(parameters.state.getType()))
+        parameters.replaceState(juce::ValueTree::fromXml(*xml));
+}
+
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+{
+    return new MonitorUtilityAudioProcessor();
 }
