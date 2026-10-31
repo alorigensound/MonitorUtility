@@ -27,6 +27,7 @@ juce_add_plugin(MonitorUtility
     COPY_PLUGIN_AFTER_BUILD FALSE
     VST3_CATEGORIES Fx Tools Stereo
 )
+juce_generate_juce_header(MonitorUtility)
 
 target_sources(MonitorUtility PRIVATE
     Source/PluginProcessor.cpp
